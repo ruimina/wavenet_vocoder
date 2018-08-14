@@ -34,8 +34,6 @@ from wavenet_vocoder import builder
 import lrschedule
 
 import torch
-from torch.utils import data as data_utils
-from torch.autograd import Variable
 from torch import nn
 from torch.nn import functional as F
 from torch import optim
@@ -60,8 +58,6 @@ from wavenet_vocoder.mixture import sample_from_discretized_mix_logistic
 
 import audio
 from hparams import hparams, hparams_debug_string
-
-fs = hparams.sample_rate
 
 global_step = 0
 global_test_step = 0
@@ -265,7 +261,6 @@ def sequence_mask(sequence_length, max_len=None):
     batch_size = sequence_length.size(0)
     seq_range = torch.arange(0, max_len).long()
     seq_range_expand = seq_range.unsqueeze(0).expand(batch_size, max_len)
-    seq_range_expand = Variable(seq_range_expand, requires_grad=False)
     if sequence_length.is_cuda:
         seq_range_expand = seq_range_expand.cuda()
     seq_length_expand = sequence_length.unsqueeze(1) \
@@ -289,11 +284,9 @@ class ExponentialMovingAverage(object):
         self.shadow[name] -= (1.0 - self.decay) * update_delta
 
 
-def clone_as_averaged_model(model, ema):
+def clone_as_averaged_model(device, model, ema):
     assert ema is not None
-    averaged_model = build_model()
-    if use_cuda:
-        averaged_model = averaged_model.cuda()
+    averaged_model = build_model().to(device)
     averaged_model.load_state_dict(model.state_dict())
     for name, param in averaged_model.named_parameters():
         if name in ema.shadow:
@@ -372,7 +365,6 @@ def collate_fn(batch):
     local_conditioning = len(batch[0]) >= 2 and hparams.cin_channels > 0
     global_conditioning = len(batch[0]) >= 3 and hparams.gin_channels > 0
 
-    # To save GPU memory... I don't want to do this though
     if hparams.max_time_sec is not None:
         max_time_steps = int(hparams.max_time_sec * hparams.sample_rate)
     elif hparams.max_time_steps is not None:
@@ -392,7 +384,6 @@ def collate_fn(batch):
                     if len(x) > max_steps:
                         max_time_frames = max_steps // audio.get_hop_size()
                         s = np.random.randint(0, len(c) - max_time_frames)
-                        #print("Size of file=%6d, t_offset=%6d"  % (len(c), s,))
                         ts = s * audio.get_hop_size()
                         x = x[ts:ts + audio.get_hop_size() * max_time_frames]
                         c = c[s:s + max_time_frames, :]
@@ -486,20 +477,24 @@ def save_waveplot(path, y_hat, y_target):
     plt.close()
 
 
-def eval_model(global_step, writer, model, y, c, g, input_lengths, eval_dir, ema=None):
+def eval_model(global_step, writer, device, model, y, c, g, input_lengths, eval_dir, ema=None):
     if ema is not None:
         print("Using averaged model for evaluation")
-        model = clone_as_averaged_model(model, ema)
+        model = clone_as_averaged_model(device, model, ema)
+        model.make_generation_fast_()
 
     model.eval()
     idx = np.random.randint(0, len(y))
-    length = input_lengths[idx].data.cpu().numpy()[0]
+    length = input_lengths[idx].data.cpu().item()
 
     # (T,)
     y_target = y[idx].view(-1).data.cpu().numpy()[:length]
 
     if c is not None:
-        c = c[idx, :, :length].unsqueeze(0)
+        if hparams.upsample_conditional_features:
+            c = c[idx, :, :length // audio.get_hop_size()].unsqueeze(0)
+        else:
+            c = c[idx, :, :length].unsqueeze(0)
         assert c.dim() == 3
         print("Shape of local conditioning features: {}".format(c.size()))
     if g is not None:
@@ -520,16 +515,17 @@ def eval_model(global_step, writer, model, y, c, g, input_lengths, eval_dir, ema
     if is_mulaw_quantize(hparams.input_type):
         initial_input = np_utils.to_categorical(
             initial_value, num_classes=hparams.quantize_channels).astype(np.float32)
-        initial_input = Variable(torch.from_numpy(initial_input)).view(
+        initial_input = torch.from_numpy(initial_input).view(
             1, 1, hparams.quantize_channels)
     else:
-        initial_input = Variable(torch.zeros(1, 1, 1).fill_(initial_value))
-    initial_input = initial_input.cuda() if use_cuda else initial_input
+        initial_input = torch.zeros(1, 1, 1).fill_(initial_value)
+    initial_input = initial_input.to(device)
 
     # Run the model in fast eval mode
-    y_hat = model.incremental_forward(
-        initial_input, c=c, g=g, T=length, softmax=True, quantize=True, tqdm=tqdm,
-        log_scale_min=hparams.log_scale_min)
+    with torch.no_grad():
+        y_hat = model.incremental_forward(
+            initial_input, c=c, g=g, T=length, softmax=True, quantize=True, tqdm=tqdm,
+            log_scale_min=hparams.log_scale_min)
 
     if is_mulaw_quantize(hparams.input_type):
         y_hat = y_hat.max(1)[1].view(-1).long().cpu().data.numpy()
@@ -556,7 +552,7 @@ def eval_model(global_step, writer, model, y, c, g, input_lengths, eval_dir, ema
 def save_states(global_step, writer, y_hat, y, input_lengths, checkpoint_dir=None):
     print("Save intermediate states at step {}".format(global_step))
     idx = np.random.randint(0, len(y_hat))
-    length = input_lengths[idx].data.cpu().numpy()[0]
+    length = input_lengths[idx].data.cpu().item()
 
     # (B, C, T)
     if y_hat.dim() == 4:
@@ -597,7 +593,7 @@ def save_states(global_step, writer, y_hat, y, input_lengths, checkpoint_dir=Non
     librosa.output.write_wav(path, y, sr=hparams.sample_rate)
 
 
-def __train_step(phase, epoch, global_step, global_test_step,
+def __train_step(device, phase, epoch, global_step, global_test_step,
                  model, optimizer, writer, criterion,
                  x, y, c, g, input_lengths,
                  checkpoint_dir, eval_dir=None, do_eval=False, ema=None):
@@ -627,15 +623,10 @@ def __train_step(phase, epoch, global_step, global_test_step,
     optimizer.zero_grad()
 
     # Prepare data
-    x, y = Variable(x), Variable(y, requires_grad=False)
-    c = Variable(c) if c is not None else None
-    g = Variable(g) if g is not None else None
-    input_lengths = Variable(input_lengths)
-    if use_cuda:
-        x, y = x.cuda(), y.cuda()
-        input_lengths = input_lengths.cuda()
-        c = c.cuda() if c is not None else None
-        g = g.cuda() if g is not None else None
+    x, y = x.to(device), y.to(device)
+    input_lengths = input_lengths.to(device)
+    c = c.to(device) if c is not None else None
+    g = g.to(device) if g is not None else None
 
     # (B, T, 1)
     mask = sequence_mask(input_lengths, max_len=x.size(-1)).unsqueeze(-1)
@@ -645,7 +636,12 @@ def __train_step(phase, epoch, global_step, global_test_step,
     # NOTE: softmax is handled in F.cross_entrypy_loss
     # y_hat: (B x C x T)
 
-    y_hat = model(x, c=c, g=g, softmax=False)
+    if use_cuda:
+        # multi gpu support
+        # you must make sure that batch size % num gpu == 0
+        y_hat = torch.nn.parallel.data_parallel(model, (x, c, g, False))
+    else:
+        y_hat = model(x, c, g, False)
 
     if is_mulaw_quantize(hparams.input_type):
         # wee need 4d inputs for spatial cross entropy loss
@@ -657,17 +653,17 @@ def __train_step(phase, epoch, global_step, global_test_step,
 
     if train and step > 0 and step % hparams.checkpoint_interval == 0:
         save_states(step, writer, y_hat, y, input_lengths, checkpoint_dir)
-        save_checkpoint(model, optimizer, step, checkpoint_dir, epoch, ema)
+        save_checkpoint(device, model, optimizer, step, checkpoint_dir, epoch, ema)
 
     if do_eval:
         # NOTE: use train step (i.e., global_step) for filename
-        eval_model(global_step, writer, model, y, c, g, input_lengths, eval_dir, ema)
+        eval_model(global_step, writer, device, model, y, c, g, input_lengths, eval_dir, ema)
 
     # Update
     if train:
         loss.backward()
         if clip_thresh > 0:
-            grad_norm = torch.nn.utils.clip_grad_norm(model.parameters(), clip_thresh)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_thresh)
         optimizer.step()
         # update moving average
         if ema is not None:
@@ -676,19 +672,16 @@ def __train_step(phase, epoch, global_step, global_test_step,
                     ema.update(name, param.data)
 
     # Logs
-    writer.add_scalar("{} loss".format(phase), float(loss.data[0]), step)
+    writer.add_scalar("{} loss".format(phase), float(loss.item()), step)
     if train:
         if clip_thresh > 0:
             writer.add_scalar("gradient norm", grad_norm, step)
         writer.add_scalar("learning rate", current_lr, step)
 
-    return loss.data[0]
+    return loss.item()
 
 
-def train_loop(model, data_loaders, optimizer, writer, checkpoint_dir=None):
-    if use_cuda:
-        model = model.cuda()
-
+def train_loop(device, model, data_loaders, optimizer, writer, checkpoint_dir=None):
     if is_mulaw_quantize(hparams.input_type):
         criterion = MaskedCrossEntropyLoss()
     else:
@@ -727,10 +720,10 @@ def train_loop(model, data_loaders, optimizer, writer, checkpoint_dir=None):
                     print("[{}] Eval at train step {}".format(phase, global_step))
 
                 # Do step
-                running_loss += __train_step(
-                    phase, global_epoch, global_step, global_test_step, model,
-                    optimizer, writer, criterion, x, y, c, g, input_lengths,
-                    checkpoint_dir, eval_dir, do_eval, ema)
+                running_loss += __train_step(device,
+                                             phase, global_epoch, global_step, global_test_step, model,
+                                             optimizer, writer, criterion, x, y, c, g, input_lengths,
+                                             checkpoint_dir, eval_dir, do_eval, ema)
 
                 # update global state
                 if train:
@@ -742,12 +735,13 @@ def train_loop(model, data_loaders, optimizer, writer, checkpoint_dir=None):
             averaged_loss = running_loss / len(data_loader)
             writer.add_scalar("{} loss (per epoch)".format(phase),
                               averaged_loss, global_epoch)
-            print("[{}] Loss: {}".format(phase, running_loss / len(data_loader)))
+            print("Step {} [{}] Loss: {}".format(
+                global_step, phase, running_loss / len(data_loader)))
 
         global_epoch += 1
 
 
-def save_checkpoint(model, optimizer, step, checkpoint_dir, epoch, ema=None):
+def save_checkpoint(device, model, optimizer, step, checkpoint_dir, epoch, ema=None):
     checkpoint_path = join(
         checkpoint_dir, "checkpoint_step{:09d}.pth".format(global_step))
     optimizer_state = optimizer.state_dict() if hparams.save_optimizer_state else None
@@ -762,7 +756,7 @@ def save_checkpoint(model, optimizer, step, checkpoint_dir, epoch, ema=None):
     print("Saved checkpoint:", checkpoint_path)
 
     if ema is not None:
-        averaged_model = clone_as_averaged_model(model, ema)
+        averaged_model = clone_as_averaged_model(device, model, ema)
         checkpoint_path = join(
             checkpoint_dir, "checkpoint_step{:09d}_ema.pth".format(global_step))
         torch.save({
@@ -802,8 +796,18 @@ def build_model():
         upsample_scales=hparams.upsample_scales,
         freq_axis_kernel_size=hparams.freq_axis_kernel_size,
         scalar_input=is_scalar_input(hparams.input_type),
+        legacy=hparams.legacy,
     )
     return model
+
+
+def _load(checkpoint_path):
+    if use_cuda:
+        checkpoint = torch.load(checkpoint_path)
+    else:
+        checkpoint = torch.load(checkpoint_path,
+                                map_location=lambda storage, loc: storage)
+    return checkpoint
 
 
 def load_checkpoint(path, model, optimizer, reset_optimizer):
@@ -812,7 +816,7 @@ def load_checkpoint(path, model, optimizer, reset_optimizer):
     global global_test_step
 
     print("Load checkpoint from: {}".format(path))
-    checkpoint = torch.load(path)
+    checkpoint = _load(path)
     model.load_state_dict(checkpoint["state_dict"])
     if not reset_optimizer:
         optimizer_state = checkpoint["optimizer"]
@@ -829,7 +833,7 @@ def load_checkpoint(path, model, optimizer, reset_optimizer):
 # https://discuss.pytorch.org/t/how-to-load-part-of-pre-trained-model/1113/3
 def restore_parts(path, model):
     print("Restore part of the model from: {}".format(path))
-    state = torch.load(path)["state_dict"]
+    state = _load(path)["state_dict"]
     model_dict = model.state_dict()
     valid_state_dict = {k: v for k, v in state.items() if k in model_dict}
 
@@ -929,16 +933,17 @@ if __name__ == "__main__":
     assert hparams.name == "wavenet_vocoder"
     print(hparams_debug_string())
 
+    fs = hparams.sample_rate
+
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     # Dataloader setup
     data_loaders = get_data_loaders(data_root, speaker_id, test_shuffle=True)
 
+    device = torch.device("cuda" if use_cuda else "cpu")
+
     # Model
-    model = build_model()
-    print(model)
-    if use_cuda:
-        model = model.cuda()
+    model = build_model().to(device)
 
     receptive_field = model.receptive_field
     print("Receptive field (samples / ms): {} / {}".format(
@@ -947,7 +952,8 @@ if __name__ == "__main__":
     optimizer = optim.Adam(model.parameters(),
                            lr=hparams.initial_learning_rate, betas=(
         hparams.adam_beta1, hparams.adam_beta2),
-        eps=hparams.adam_eps, weight_decay=hparams.weight_decay)
+        eps=hparams.adam_eps, weight_decay=hparams.weight_decay,
+        amsgrad=hparams.amsgrad)
 
     if checkpoint_restore_parts is not None:
         restore_parts(checkpoint_restore_parts, model)
@@ -964,13 +970,14 @@ if __name__ == "__main__":
 
     # Train!
     try:
-        train_loop(model, data_loaders, optimizer, writer, checkpoint_dir=checkpoint_dir)
+        train_loop(device, model, data_loaders, optimizer, writer,
+                   checkpoint_dir=checkpoint_dir)
     except KeyboardInterrupt:
         print("Interrupted!")
         pass
     finally:
         save_checkpoint(
-            model, optimizer, global_step, checkpoint_dir, global_epoch)
+            device, model, optimizer, global_step, checkpoint_dir, global_epoch)
 
     print("Finished")
 
